@@ -16,7 +16,7 @@ COPY . .
 
 # Cache location for HF models (optional)
 ENV HF_HOME=/app/.cache/huggingface
-ENV PORT=10000
+ENV PORT=4000
 
 # Start
 CMD uvicorn main:app --host 0.0.0.0 --port ${PORT}
