@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: ragyverse-api
+    env: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ELEVEN_LABS_API_KEY
+        sync: false
+      - key: VOICE_ID
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
