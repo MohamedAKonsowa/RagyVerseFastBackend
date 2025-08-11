@@ -217,6 +217,8 @@ async def upload_pdf(file: UploadFile = File(...)):
     if not file.filename.endswith(".pdf"):
         return JSONResponse(content={"error": "Upload a PDF file"}, status_code=400)
 
+    await reset()
+
     document_text = extract_text_from_pdf(file)
     if document_text.startswith("❌") or document_text.startswith("⚠️"):
         return JSONResponse(content={"error": document_text}, status_code=500)
