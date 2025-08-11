@@ -1,0 +1,75 @@
+import os
+import shutil
+from tempfile import NamedTemporaryFile
+from fastapi import FastAPI, Form
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from elevenlabs import ElevenLabs
+from dotenv import load_dotenv
+from pydub import AudioSegment
+
+load_dotenv()
+
+app = FastAPI()
+
+# CORS setup (for local development)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # For production, restrict this!
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Load ElevenLabs API credentials
+api_key = os.getenv("ELEVEN_LABS_API_KEY")
+VOICE_ID = os.getenv("VOICE_ID")
+if not api_key or not VOICE_ID:
+    raise RuntimeError("ELEVEN_LABS_API_KEY or VOICE_ID missing in environment")
+
+elevenlabs = ElevenLabs(api_key=api_key)
+
+
+@app.post("/clone-voice/")
+async def generate_voice_from_text(text: str = Form(...)):
+    print("Received text input:", text)
+
+    try:
+        # Generate speech
+        audio_bytes = b"".join(elevenlabs.text_to_speech.convert(
+            text=text,
+            voice_id=VOICE_ID,
+            model_id="eleven_multilingual_v2",
+            output_format="mp3_44100_128"
+        ))
+
+        # Save temporary MP3
+        temp_mp3 = NamedTemporaryFile(delete=False, suffix=".mp3")
+        temp_mp3.write(audio_bytes)
+        temp_mp3.flush()
+
+        # Convert MP3 to WAV
+        sound = AudioSegment.from_file(temp_mp3.name, format="mp3")
+        output_wav_path = temp_mp3.name.replace(".mp3", ".wav")
+        sound.export(output_wav_path, format="wav", parameters=["-acodec", "pcm_s16le"])
+
+        # Save permanent file
+        os.makedirs("saved_outputs", exist_ok=True)
+        final_path = os.path.join("saved_outputs", "latest_output.wav")
+        shutil.copy(output_wav_path, final_path)
+
+        print("✅ Audio saved to:", final_path)
+        return JSONResponse({"status": "success", "message": "Audio cloned successfully."})
+
+    except Exception as e:
+        print("❌ Error generating audio:", e)
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+@app.get("/audio/cloned.wav")
+async def get_cloned_audio():
+    final_path = os.path.join("saved_outputs", "latest_output.wav")
+    if os.path.exists(final_path):
+        return FileResponse(final_path, media_type="audio/wav", filename="cloned.wav")
+    else:
+        return JSONResponse({"status": "error", "message": "Audio file not found"}, status_code=404)
