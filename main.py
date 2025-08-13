@@ -474,14 +474,17 @@ async def get_tts(filename: str):
         return JSONResponse(content={"error": "Audio not found"}, status_code=404)
     return FileResponse(path, media_type="audio/mpeg")
 
+# keep your existing route name/path the same
 @app.get("/audio/cloned.wav")
 async def get_cloned_audio():
-    """
-    Keep the existing URL but serve the MP3 we generate (Unity should request AudioType.MPEG).
-    """
     path_mp3 = os.path.join("saved_outputs", "cloned.mp3")
     if os.path.exists(path_mp3):
-        return FileResponse(path_mp3, media_type="audio/mpeg", filename="cloned.mp3")
+        # NOTE: serve MP3 bytes, but present as "cloned.wav" to satisfy the URL
+        return FileResponse(
+            path_mp3,
+            media_type="audio/mpeg",
+            filename="cloned.wav"  # <- was cloned.mp3; this matches the URL suffix
+        )
     return JSONResponse({"status": "error", "message": "Audio not found"}, status_code=404)
 
 @app.post("/reset")
