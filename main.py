@@ -66,7 +66,8 @@ client_11labs = ElevenLabs(api_key=ELEVEN_API_KEY)
 
 TTS_MODEL_ID = os.getenv("TTS_MODEL_ID", "eleven_multilingual_v2")
 TTS_MP3_FORMAT = os.getenv("TTS_MP3_FORMAT", "mp3_22050_32")  # small & fast
-MAX_SPOKEN_CHARS = int(os.getenv("MAX_SPOKEN_CHARS", "420"))  # keep short for speed
+# We keep MAX_SPOKEN_CHARS for compatibility, but won't use it to truncate.
+MAX_SPOKEN_CHARS = int(os.getenv("MAX_SPOKEN_CHARS", "420"))
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "220"))
 
 # -----------------------------
@@ -249,35 +250,48 @@ def pack_context_with_citations(docs: List[Document]) -> Tuple[str, List[dict]]:
     return "\n".join(snippets), cites
 
 # -----------------------------
-# TTS: MP3-only (fast path)
+# TTS: MP3-only (no clipping) + atomic writes
 # -----------------------------
 def _shorten_for_tts(answer: str, limit: int = MAX_SPOKEN_CHARS) -> str:
-    if len(answer) <= limit:
-        return answer
-    cut = answer[:limit]
-    for p in [". ", "! ", "? ", "; "]:
-        i = cut.rfind(p)
-        if i > 200:
-            return cut[:i+1]
-    return cut
+    """
+    NO-OP: Do not shorten anymore (kept for compatibility).
+    """
+    return answer
+
+def _atomic_write_bytes(target_path: str, data: bytes):
+    """
+    Write to a temp file in the same directory, then atomically replace target.
+    Prevents readers from seeing partially-written files.
+    """
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    tmp_path = os.path.join(
+        os.path.dirname(target_path),
+        f".tmp_{os.path.basename(target_path)}_{int(time.time()*1000)}"
+    )
+    with open(tmp_path, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, target_path)  # atomic on same filesystem
 
 def generate_tts(answer_text: str) -> tuple:
     """
-    Generate MP3 only (fast).
+    Generate full MP3 (no truncation).
     Writes:
-      - static/response_<ts>.mp3         -> served by /tts/{filename} (frontend unchanged)
-      - saved_outputs/cloned.mp3         -> served by EXISTING /audio/cloned.wav route (as audio/mpeg)
+      - static/response_<ts>.mp3           (unique per request)
+      - saved_outputs/cloned.mp3           (latest response, atomically replaced)
     Returns (mp3_path, None) to keep call sites unchanged.
     """
     os.makedirs("static", exist_ok=True)
     os.makedirs("saved_outputs", exist_ok=True)
 
-    voice_text = _shorten_for_tts(answer_text)
+    # FULL text, no clipping.
+    voice_text = answer_text
 
     filename_base = f"response_{int(time.time())}"
     mp3_path = os.path.join("static", filename_base + ".mp3")
-    cloned_mp3 = os.path.join("saved_outputs", "cloned.mp3")
 
+    # Pull full MP3 bytes from ElevenLabs
     mp3_bytes = b"".join(
         client_11labs.text_to_speech.convert(
             text=voice_text,
@@ -287,10 +301,12 @@ def generate_tts(answer_text: str) -> tuple:
         )
     )
 
-    with open(mp3_path, "wb") as f:
-        f.write(mp3_bytes)
-    with open(cloned_mp3, "wb") as f:
-        f.write(mp3_bytes)
+    # Write the per-request file (unique name)
+    _atomic_write_bytes(mp3_path, mp3_bytes)
+
+    # Update the "latest" alias atomically to avoid truncation mid-stream
+    cloned_mp3 = os.path.join("saved_outputs", "cloned.mp3")
+    _atomic_write_bytes(cloned_mp3, mp3_bytes)
 
     return mp3_path, None
 
@@ -362,7 +378,7 @@ def chat_with_bot(query: str):
             "answer": answer,
             "citations": citations,
             "mp3_path": mp3_path,
-            "wav_path": None,  # preserved key; not used now
+            "wav_path": None,  # preserved key
         }, mp3_path
     except Exception as e:
         traceback.print_exc()
@@ -479,11 +495,11 @@ async def get_tts(filename: str):
 async def get_cloned_audio():
     path_mp3 = os.path.join("saved_outputs", "cloned.mp3")
     if os.path.exists(path_mp3):
-        # NOTE: serve MP3 bytes, but present as "cloned.wav" to satisfy the URL
+        # Serve MP3 bytes via the legacy .wav URL (frontend unchanged)
         return FileResponse(
             path_mp3,
-            media_type="audio/mpeg",
-            filename="cloned.wav"  # <- was cloned.mp3; this matches the URL suffix
+            media_type="audio/mpeg",  # correct MIME for the actual content
+            filename="cloned.wav"
         )
     return JSONResponse({"status": "error", "message": "Audio not found"}, status_code=404)
 
