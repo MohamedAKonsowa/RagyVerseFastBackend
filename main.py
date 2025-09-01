@@ -2,6 +2,8 @@ import os
 import json
 import time
 import traceback
+import threading
+from uuid import uuid4
 from io import BytesIO
 from tempfile import NamedTemporaryFile
 from typing import Optional, List, Tuple
@@ -10,7 +12,7 @@ import fitz  # PyMuPDF
 import networkx as nx
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 
 from elevenlabs.client import ElevenLabs
@@ -21,9 +23,9 @@ from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 
-# -----------------------------
+# ---------------------------------
 # ENV & APP
-# -----------------------------
+# ---------------------------------
 load_dotenv()
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -49,14 +51,14 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "900"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
 TOP_K_RERANK = int(os.getenv("TOP_K_RERANK", "3"))  # tight for speed
 
-# -----------------------------
+# ---------------------------------
 # API KEYS / CLIENTS
-# -----------------------------
+# ---------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
 oai_client = OpenAI(api_key=OPENAI_API_KEY)
-GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
+GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")  # for speed, gpt-4.1-nano is fastest
 
 ELEVEN_API_KEY = os.getenv("ELEVEN_LABS_API_KEY")
 VOICE_ID = os.getenv("VOICE_ID")
@@ -65,14 +67,17 @@ if not ELEVEN_API_KEY or not VOICE_ID:
 client_11labs = ElevenLabs(api_key=ELEVEN_API_KEY)
 
 TTS_MODEL_ID = os.getenv("TTS_MODEL_ID", "eleven_multilingual_v2")
-TTS_MP3_FORMAT = os.getenv("TTS_MP3_FORMAT", "mp3_22050_32")  # small & fast
+# ElevenLabs allowed formats include:
+# mp3_22050_32, mp3_44100_32|64|96|128|192, pcm_8000|16000|22050|24000|44100|48000, ulaw_8000, alaw_8000, opus_48000_32|64|96|128|192
+TTS_FORMAT = os.getenv("TTS_MP3_FORMAT", "mp3_22050_32")
+
 # We keep MAX_SPOKEN_CHARS for compatibility, but won't use it to truncate.
 MAX_SPOKEN_CHARS = int(os.getenv("MAX_SPOKEN_CHARS", "420"))
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "220"))
 
-# -----------------------------
+# ---------------------------------
 # GLOBAL STATE
-# -----------------------------
+# ---------------------------------
 document_text = ""
 knowledge_graph: Optional[nx.DiGraph] = None
 graph_triples: List[tuple] = []
@@ -84,6 +89,56 @@ _embeddings = None
 _reranker = None
 _ocr_pipe = None
 
+# TTS stream registry
+_tts_lock = threading.Lock()
+# filename -> {"format": str, "ext": str, "started": float}
+_tts_registry = {}
+
+# ---------------------------------
+# Utils
+# ---------------------------------
+import io, wave, re
+
+def _pcm_to_wav_bytes(pcm_bytes: bytes, sample_rate: int, channels: int = 1, sampwidth: int = 2) -> bytes:
+    """Wrap raw PCM into a RIFF/WAV container."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(sampwidth)  # 2 bytes = 16-bit
+        w.setframerate(sample_rate)
+        # ensure even length for 16-bit samples
+        if sampwidth == 2 and (len(pcm_bytes) % 2) != 0:
+            pcm_bytes = pcm_bytes[:-1]
+        w.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+def _parse_rate(fmt: str, default: int = 16000) -> int:
+    m = re.search(r'_(\d{4,5})', fmt)
+    return int(m.group(1)) if m else default
+
+def _infer_ext(fmt: str) -> str:
+    f = fmt.lower()
+    if f.startswith("mp3"): return "mp3"
+    if f.startswith("opus"): return "opus"
+    if f.startswith("pcm"): return "wav"  # we wrap to WAV
+    if f.startswith("ulaw") or f.startswith("alaw"): return "wav"  # commonly wrapped to WAV for playback
+    return "bin"
+
+def _atomic_write_bytes(target_path: str, data: bytes):
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    tmp_path = os.path.join(
+        os.path.dirname(target_path),
+        f".tmp_{os.path.basename(target_path)}_{int(time.time()*1000)}"
+    )
+    with open(tmp_path, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, target_path)
+
+# ---------------------------------
+# NLP helpers
+# ---------------------------------
 def get_spacy():
     global _spacy_nlp
     if _spacy_nlp is None:
@@ -117,9 +172,9 @@ def get_reranker():
         _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
     return _reranker
 
-# -----------------------------
+# ---------------------------------
 # GPT helper
-# -----------------------------
+# ---------------------------------
 def call_gpt(system_prompt: str, user_prompt: str) -> str:
     resp = oai_client.responses.create(
         model=GPT_MODEL,
@@ -135,11 +190,13 @@ def call_gpt(system_prompt: str, user_prompt: str) -> str:
     except Exception:
         return (getattr(resp, "output", "") or "").strip() or "No answer returned."
 
-# -----------------------------
+# ---------------------------------
 # PDF → Text (optional OCR)
-# -----------------------------
+# ---------------------------------
 def extract_text_from_pdf(file: UploadFile) -> str:
     end_total = _timed("pdf_total")
+    temp_path = None
+    doc = None
     try:
         temp_path = NamedTemporaryFile(delete=False, suffix=".pdf").name
         with open(temp_path, "wb") as f:
@@ -169,17 +226,23 @@ def extract_text_from_pdf(file: UploadFile) -> str:
                     except Exception:
                         pass
 
-        os.unlink(temp_path)
         out = "\n".join(extracted).strip() if extracted else "⚠️ No extractable text found"
         return out
     except Exception as e:
         return f"❌ Error processing PDF: {e}"
     finally:
+        try:
+            if doc: doc.close()
+        except Exception:
+            pass
+        if temp_path and os.path.exists(temp_path):
+            try: os.unlink(temp_path)
+            except Exception: pass
         end_total()
 
-# -----------------------------
+# ---------------------------------
 # Simple Knowledge Graph
-# -----------------------------
+# ---------------------------------
 def build_knowledge_graph(text: str):
     global knowledge_graph, graph_triples
     knowledge_graph = nx.DiGraph()
@@ -206,9 +269,9 @@ def query_knowledge_graph(query: str):
         if q in u.lower() or q in v.lower()
     ]
 
-# -----------------------------
+# ---------------------------------
 # Retrieval (FAISS) + MMR + Rerank
-# -----------------------------
+# ---------------------------------
 def initialize_retriever(text: str):
     global retriever
     splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
@@ -249,70 +312,81 @@ def pack_context_with_citations(docs: List[Document]) -> Tuple[str, List[dict]]:
         cites.append({"id": idx, "chunk_id": cid})
     return "\n".join(snippets), cites
 
-# -----------------------------
-# TTS: MP3-only (no clipping) + atomic writes
-# -----------------------------
-def _shorten_for_tts(answer: str, limit: int = MAX_SPOKEN_CHARS) -> str:
+# ---------------------------------
+# TTS: background generation + streaming
+# ---------------------------------
+def _start_tts_background(answer_text: str, fmt: str) -> str:
     """
-    NO-OP: Do not shorten anymore (kept for compatibility).
+    Start ElevenLabs TTS in a background thread.
+    Returns the filename (with extension) that the client can GET via /tts/{filename}.
     """
-    return answer
+    ext = _infer_ext(fmt)
+    base = f"response_{int(time.time())}_{uuid4().hex[:8]}"
+    final_name = f"{base}.{ext}"
+    final_path = os.path.join("static", final_name)
 
-def _atomic_write_bytes(target_path: str, data: bytes):
-    """
-    Write to a temp file in the same directory, then atomically replace target.
-    Prevents readers from seeing partially-written files.
-    """
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    tmp_path = os.path.join(
-        os.path.dirname(target_path),
-        f".tmp_{os.path.basename(target_path)}_{int(time.time()*1000)}"
-    )
-    with open(tmp_path, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, target_path)  # atomic on same filesystem
+    # record registry (for visibility / debugging)
+    with _tts_lock:
+        _tts_registry[final_name] = {"format": fmt, "ext": ext, "started": time.time()}
 
-def generate_tts(answer_text: str) -> tuple:
-    """
-    Generate full MP3 (no truncation).
-    Writes:
-      - static/response_<ts>.mp3           (unique per request)
-      - saved_outputs/cloned.mp3           (latest response, atomically replaced)
-    Returns (mp3_path, None) to keep call sites unchanged.
-    """
-    os.makedirs("static", exist_ok=True)
-    os.makedirs("saved_outputs", exist_ok=True)
+    def worker():
+        try:
+            # MP3/OPUS path: stream-write into a temp file (for live tail)
+            if ext in ("mp3", "opus"):
+                tmp_path = os.path.join("static", f".tmp_{final_name}")
+                with open(tmp_path, "wb") as wf:
+                    for chunk in client_11labs.text_to_speech.convert(
+                        text=answer_text,
+                        voice_id=VOICE_ID,
+                        model_id=TTS_MODEL_ID,
+                        output_format=fmt,
+                    ):
+                        wf.write(chunk)
+                os.replace(tmp_path, final_path)
 
-    # FULL text, no clipping.
-    voice_text = answer_text
+                # update cloned.* (latest)
+                cloned = os.path.join("saved_outputs", f"cloned.{ext}")
+                try:
+                    with open(final_path, "rb") as rf:
+                        _atomic_write_bytes(cloned, rf.read())
+                except Exception:
+                    pass
 
-    filename_base = f"response_{int(time.time())}"
-    mp3_path = os.path.join("static", filename_base + ".mp3")
+            else:
+                # PCM/ULAW/ALAW path: accumulate and wrap to WAV, then write final in one go
+                pcm_bytes = b"".join(client_11labs.text_to_speech.convert(
+                    text=answer_text,
+                    voice_id=VOICE_ID,
+                    model_id=TTS_MODEL_ID,
+                    output_format=fmt,
+                ))
+                # sample rate from format, default 16k
+                sr = _parse_rate(fmt, default=16000)
+                wav_bytes = _pcm_to_wav_bytes(pcm_bytes, sample_rate=sr, channels=1, sampwidth=2)
+                _atomic_write_bytes(final_path, wav_bytes)
 
-    # Pull full MP3 bytes from ElevenLabs
-    mp3_bytes = b"".join(
-        client_11labs.text_to_speech.convert(
-            text=voice_text,
-            voice_id=VOICE_ID,
-            model_id=TTS_MODEL_ID,
-            output_format=TTS_MP3_FORMAT,
-        )
-    )
+                # update cloned.wav
+                cloned = os.path.join("saved_outputs", "cloned.wav")
+                _atomic_write_bytes(cloned, wav_bytes)
 
-    # Write the per-request file (unique name)
-    _atomic_write_bytes(mp3_path, mp3_bytes)
+        except Exception as e:
+            print(f"❌ TTS worker error for {final_name}: {e}")
+        finally:
+            pass
 
-    # Update the "latest" alias atomically to avoid truncation mid-stream
-    cloned_mp3 = os.path.join("saved_outputs", "cloned.mp3")
-    _atomic_write_bytes(cloned_mp3, mp3_bytes)
+    threading.Thread(target=worker, daemon=True).start()
+    return final_name
 
-    return mp3_path, None
+def _mime_for_ext(filename: str) -> str:
+    lower = filename.lower()
+    if lower.endswith(".mp3"): return "audio/mpeg"
+    if lower.endswith(".wav"): return "audio/wav"
+    if lower.endswith(".opus"): return "audio/ogg"  # Opus-in-Ogg
+    return "application/octet-stream"
 
-# -----------------------------
+# ---------------------------------
 # STT
-# -----------------------------
+# ---------------------------------
 def transcribe_audio(file: UploadFile) -> str:
     try:
         audio_data = BytesIO(file.file.read())
@@ -327,15 +401,16 @@ def transcribe_audio(file: UploadFile) -> str:
     except Exception as e:
         return f"❌ Error transcribing: {e}"
 
-# -----------------------------
-# Chat core
-# -----------------------------
-def chat_with_bot(query: str):
+# ---------------------------------
+# Chat core (returns answer text only; TTS is decoupled)
+# ---------------------------------
+def chat_with_bot_text_only(query: str):
     end_total = _timed("chat_total")
     try:
         global document_text, retriever
         if not document_text:
-            return {"error": "❌ Upload a PDF first"}, None
+            return {"error": "❌ Upload a PDF first"}
+
         if not retriever:
             initialize_retriever(document_text)
 
@@ -370,25 +445,19 @@ def chat_with_bot(query: str):
         answer = call_gpt(system_prompt, user_prompt)
         end_step()
 
-        end_step = _timed("tts_make")
-        mp3_path, _ = generate_tts(answer)
-        end_step()
-
         return {
             "answer": answer,
             "citations": citations,
-            "mp3_path": mp3_path,
-            "wav_path": None,  # preserved key
-        }, mp3_path
+        }
     except Exception as e:
         traceback.print_exc()
-        return {"error": str(e)}, None
+        return {"error": str(e)}
     finally:
         end_total()
 
-# -----------------------------
+# ---------------------------------
 # ROUTES
-# -----------------------------
+# ---------------------------------
 @app.on_event("startup")
 async def warm_start():
     try:
@@ -404,14 +473,19 @@ async def warm_start():
         _ = rr.predict([("warmup", "warmup")])  # lightweight warm
     except Exception:
         pass
-    # Warm TTS (short)
+    # TTS warm (non-blocking/logging only)
     try:
-        _ = b"".join(client_11labs.text_to_speech.convert(
+        # Tiny ping to ensure credentials OK (no need to b"".join big audio)
+        _ = client_11labs.text_to_speech.convert(
             text="Hello.",
             voice_id=VOICE_ID,
             model_id=TTS_MODEL_ID,
-            output_format=TTS_MP3_FORMAT,
-        ))
+            output_format=TTS_FORMAT,
+        )
+        # consume just the first tiny chunk if any
+        for i, chunk in enumerate(_):
+            # don't keep the generator around; this is just a credentials check
+            break
         print("✅ TTS warm")
     except Exception as e:
         print(f"⚠️ TTS warm failed: {e}")
@@ -439,14 +513,16 @@ async def ask_text(data: dict):
     if not question:
         return JSONResponse(content={"error": "No question provided"}, status_code=400)
 
-    response, mp3_path = chat_with_bot(question)
+    response = chat_with_bot_text_only(question)
     if "error" in response:
         return JSONResponse(content=response, status_code=500)
 
+    # Start TTS in background immediately; return same-shaped payload as before
+    filename = _start_tts_background(response["answer"], fmt=TTS_FORMAT)
     return {
         "answer": response["answer"],
         "citations": response.get("citations", []),
-        "audio_url": f"/tts/{os.path.basename(mp3_path)}",
+        "audio_url": f"/tts/{filename}",
     }
 
 @app.post("/ask_audio")
@@ -459,15 +535,16 @@ async def ask_audio(file: UploadFile = File(...)):
         if question.startswith("❌"):
             raise ValueError(f"Transcription failed: {question}")
 
-        response, mp3_path = chat_with_bot(question)
+        response = chat_with_bot_text_only(question)
         if "error" in response:
             raise ValueError(f"Bot returned error: {response['error']}")
 
+        filename = _start_tts_background(response["answer"], fmt=TTS_FORMAT)
         return {
             "question": question,
             "answer": response["answer"],
             "citations": response.get("citations", []),
-            "audio_url": f"/tts/{os.path.basename(mp3_path)}",
+            "audio_url": f"/tts/{filename}",
         }
 
     except Exception as e:
@@ -485,21 +562,74 @@ async def ask_audio(file: UploadFile = File(...)):
 
 @app.get("/tts/{filename}")
 async def get_tts(filename: str):
-    path = os.path.join("static", filename)
-    if not os.path.exists(path):
-        return JSONResponse(content={"error": "Audio not found"}, status_code=404)
-    return FileResponse(path, media_type="audio/mpeg")
+    """
+    Dual-mode:
+      - If the finalized file exists, serve it with correct MIME.
+      - Else, if an MP3/OPUS temp file is being written, 'tail' it so the client gets bytes ASAP.
+      - Else (PCM path), wait until final WAV appears and then stream it.
+    """
+    static_dir = "static"
+    path = os.path.join(static_dir, filename)
+    if os.path.exists(path):
+        return FileResponse(path, media_type=_mime_for_ext(filename))
+
+    # If not ready, attempt to stream from temp (MP3/OPUS path) or wait for final (PCM path)
+    fmt = TTS_FORMAT.lower()
+    ext = _infer_ext(fmt)
+    tmp_path = os.path.join(static_dir, f".tmp_{filename}")  # mp3/opus temp pattern
+
+    def tail_file():
+        last = 0
+        # If PCM: no usable tmp; wait until final exists then stream
+        mp3_or_opus = ext in ("mp3", "opus")
+        while True:
+            # If final file appears while waiting, stream it and exit
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    f.seek(last)
+                    chunk = f.read(64 * 1024)
+                    while chunk:
+                        yield chunk
+                        last = f.tell()
+                        chunk = f.read(64 * 1024)
+                break
+
+            # If we have a temp file (mp3/opus), tail it as it's being written
+            if mp3_or_opus and os.path.exists(tmp_path):
+                with open(tmp_path, "rb") as f:
+                    f.seek(last)
+                    chunk = f.read(64 * 1024)
+                    while chunk:
+                        yield chunk
+                        last = f.tell()
+                        chunk = f.read(64 * 1024)
+
+            # brief sleep to avoid busy loop
+            time.sleep(0.05)
+
+    # pick a MIME to help the browser start decoding correctly
+    mt = _mime_for_ext(filename if ext in ("mp3", "opus") else (filename[:-3] + "wav"))
+    return StreamingResponse(tail_file(), media_type=mt)
 
 # keep your existing route name/path the same
 @app.get("/audio/cloned.wav")
 async def get_cloned_audio():
-    path_mp3 = os.path.join("saved_outputs", "cloned.mp3")
-    if os.path.exists(path_mp3):
-        # Serve MP3 bytes via the legacy .wav URL (frontend unchanged)
+    # prefer actual WAV if present
+    wav_p = os.path.join("saved_outputs", "cloned.wav")
+    if os.path.exists(wav_p):
         return FileResponse(
-            path_mp3,
-            media_type="audio/mpeg",  # correct MIME for the actual content
-            filename="cloned.wav"
+            wav_p, media_type="audio/wav", filename="cloned.wav"
+        )
+    # fallbacks (serve under .wav name for legacy client)
+    mp3_p = os.path.join("saved_outputs", "cloned.mp3")
+    if os.path.exists(mp3_p):
+        return FileResponse(
+            mp3_p, media_type="audio/mpeg", filename="cloned.wav"
+        )
+    opus_p = os.path.join("saved_outputs", "cloned.opus")
+    if os.path.exists(opus_p):
+        return FileResponse(
+            opus_p, media_type="audio/ogg", filename="cloned.wav"
         )
     return JSONResponse({"status": "error", "message": "Audio not found"}, status_code=404)
 
