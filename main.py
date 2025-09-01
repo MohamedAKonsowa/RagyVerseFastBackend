@@ -2,16 +2,15 @@ import os
 import json
 import time
 import traceback
-import threading
 from io import BytesIO
 from tempfile import NamedTemporaryFile
 from typing import Optional, List, Tuple
 
 import fitz  # PyMuPDF
 import networkx as nx
-from fastapi import FastAPI, File, UploadFile, Request
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from dotenv import load_dotenv
 
 from elevenlabs.client import ElevenLabs
@@ -37,12 +36,11 @@ def _timed(label: str):
 
 app = FastAPI(title="RagyVerse API (GPT-powered)", docs_url="/docs", redoc_url="/redoc")
 app.add_middleware(
-    CORSMiddleware(
-        allow_origins=["*"],  # TODO: restrict in production
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    CORSMiddleware,
+    allow_origins=["*"],  # TODO: restrict in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Feature knobs
@@ -67,9 +65,9 @@ if not ELEVEN_API_KEY or not VOICE_ID:
 client_11labs = ElevenLabs(api_key=ELEVEN_API_KEY)
 
 TTS_MODEL_ID = os.getenv("TTS_MODEL_ID", "eleven_multilingual_v2")
-# Allowed: 'mp3_22050_32', 'mp3_44100_32|64|96|128|192', 'pcm_*', 'opus_*' (avoid opus/pcm for Unity)
-TTS_MP3_FORMAT = os.getenv("TTS_MP3_FORMAT", "mp3_22050_32")
-MAX_SPOKEN_CHARS = int(os.getenv("MAX_SPOKEN_CHARS", "420"))  # kept for compat; not used
+TTS_MP3_FORMAT = os.getenv("TTS_MP3_FORMAT", "mp3_22050_32")  # small & fast
+# We keep MAX_SPOKEN_CHARS for compatibility, but won't use it to truncate.
+MAX_SPOKEN_CHARS = int(os.getenv("MAX_SPOKEN_CHARS", "420"))
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "220"))
 
 # -----------------------------
@@ -86,42 +84,6 @@ _embeddings = None
 _reranker = None
 _ocr_pipe = None
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def _atomic_write_bytes(target_path: str, data: bytes):
-    """
-    Atomic write: write to a temp then move into place.
-    """
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    tmp_path = os.path.join(
-        os.path.dirname(target_path),
-        f".tmp_{os.path.basename(target_path)}_{int(time.time()*1000)}"
-    )
-    with open(tmp_path, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, target_path)
-
-def _ensure_empty(path: str):
-    """
-    Ensure an empty file exists (so routes can stream immediately).
-    """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as f:
-        pass  # create/truncate
-
-def _mime_for_ext(filename: str) -> str:
-    lower = filename.lower()
-    if lower.endswith(".mp3"): return "audio/mpeg"
-    if lower.endswith(".wav"): return "audio/wav"
-    if lower.endswith(".opus"): return "audio/ogg"
-    return "application/octet-stream"
-
-# -----------------------------
-# NLP helpers
-# -----------------------------
 def get_spacy():
     global _spacy_nlp
     if _spacy_nlp is None:
@@ -288,57 +250,65 @@ def pack_context_with_citations(docs: List[Document]) -> Tuple[str, List[dict]]:
     return "\n".join(snippets), cites
 
 # -----------------------------
-# TTS: progressive background writer (MP3)
+# TTS: MP3-only (no clipping) + atomic writes
 # -----------------------------
-def _start_tts_background(answer_text: str) -> str:
+def _shorten_for_tts(answer: str, limit: int = MAX_SPOKEN_CHARS) -> str:
     """
-    Start ElevenLabs TTS in a background thread and stream MP3 bytes to:
-      - static/.tmp_response_<ts>.mp3  (progressively written, then renamed to static/response_<ts>.mp3)
-      - saved_outputs/.tmp_cloned.mp3  (progressively written, then renamed to saved_outputs/cloned.mp3)
-    Returns the final basename 'response_<ts>.mp3' so the client can GET /tts/<that>.
+    NO-OP: Do not shorten anymore (kept for compatibility).
     """
-    ts = int(time.time())
-    final_name = f"response_{ts}.mp3"
+    return answer
 
-    static_dir = "static"
-    saved_dir = "saved_outputs"
-    os.makedirs(static_dir, exist_ok=True)
-    os.makedirs(saved_dir, exist_ok=True)
+def _atomic_write_bytes(target_path: str, data: bytes):
+    """
+    Write to a temp file in the same directory, then atomically replace target.
+    Prevents readers from seeing partially-written files.
+    """
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    tmp_path = os.path.join(
+        os.path.dirname(target_path),
+        f".tmp_{os.path.basename(target_path)}_{int(time.time()*1000)}"
+    )
+    with open(tmp_path, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, target_path)  # atomic on same filesystem
 
-    tmp_static = os.path.join(static_dir, f".tmp_{final_name}")
-    final_static = os.path.join(static_dir, final_name)
-    tmp_cloned = os.path.join(saved_dir, ".tmp_cloned.mp3")
-    final_cloned = os.path.join(saved_dir, "cloned.mp3")
+def generate_tts(answer_text: str) -> tuple:
+    """
+    Generate full MP3 (no truncation).
+    Writes:
+      - static/response_<ts>.mp3           (unique per request)
+      - saved_outputs/cloned.mp3           (latest response, atomically replaced)
+    Returns (mp3_path, None) to keep call sites unchanged.
+    """
+    os.makedirs("static", exist_ok=True)
+    os.makedirs("saved_outputs", exist_ok=True)
 
-    # Ensure empty temp files exist so routes can stream immediately
-    _ensure_empty(tmp_static)
-    _ensure_empty(tmp_cloned)
+    # FULL text, no clipping.
+    voice_text = answer_text
 
-    def worker():
-        try:
-            # Stream bytes from ElevenLabs and append to both tmp files
-            stream = client_11labs.text_to_speech.convert(
-                text=answer_text,
-                voice_id=VOICE_ID,
-                model_id=TTS_MODEL_ID,
-                output_format=TTS_MP3_FORMAT,
-            )
-            with open(tmp_static, "ab") as fs, open(tmp_cloned, "ab") as fc:
-                for chunk in stream:
-                    if not chunk:
-                        continue
-                    fs.write(chunk)
-                    fc.write(chunk)
-                    fs.flush(); os.fsync(fs.fileno())
-                    fc.flush(); os.fsync(fc.fileno())
-            # Atomically publish final files
-            os.replace(tmp_static, final_static)
-            os.replace(tmp_cloned, final_cloned)
-        except Exception as e:
-            print(f"❌ TTS worker error: {e}")
+    filename_base = f"response_{int(time.time())}"
+    mp3_path = os.path.join("static", filename_base + ".mp3")
 
-    threading.Thread(target=worker, daemon=True).start()
-    return final_name
+    # Pull full MP3 bytes from ElevenLabs
+    mp3_bytes = b"".join(
+        client_11labs.text_to_speech.convert(
+            text=voice_text,
+            voice_id=VOICE_ID,
+            model_id=TTS_MODEL_ID,
+            output_format=TTS_MP3_FORMAT,
+        )
+    )
+
+    # Write the per-request file (unique name)
+    _atomic_write_bytes(mp3_path, mp3_bytes)
+
+    # Update the "latest" alias atomically to avoid truncation mid-stream
+    cloned_mp3 = os.path.join("saved_outputs", "cloned.mp3")
+    _atomic_write_bytes(cloned_mp3, mp3_bytes)
+
+    return mp3_path, None
 
 # -----------------------------
 # STT
@@ -358,15 +328,14 @@ def transcribe_audio(file: UploadFile) -> str:
         return f"❌ Error transcribing: {e}"
 
 # -----------------------------
-# Chat core (no TTS blocking)
+# Chat core
 # -----------------------------
-def chat_with_bot_text_only(query: str):
+def chat_with_bot(query: str):
     end_total = _timed("chat_total")
     try:
         global document_text, retriever
         if not document_text:
-            return {"error": "❌ Upload a PDF first"}
-
+            return {"error": "❌ Upload a PDF first"}, None
         if not retriever:
             initialize_retriever(document_text)
 
@@ -401,10 +370,19 @@ def chat_with_bot_text_only(query: str):
         answer = call_gpt(system_prompt, user_prompt)
         end_step()
 
-        return {"answer": answer, "citations": citations}
+        end_step = _timed("tts_make")
+        mp3_path, _ = generate_tts(answer)
+        end_step()
+
+        return {
+            "answer": answer,
+            "citations": citations,
+            "mp3_path": mp3_path,
+            "wav_path": None,  # preserved key
+        }, mp3_path
     except Exception as e:
         traceback.print_exc()
-        return {"error": str(e)}
+        return {"error": str(e)}, None
     finally:
         end_total()
 
@@ -426,17 +404,14 @@ async def warm_start():
         _ = rr.predict([("warmup", "warmup")])  # lightweight warm
     except Exception:
         pass
-    # Warm TTS (credential sanity check, non-blocking)
+    # Warm TTS (short)
     try:
-        it = client_11labs.text_to_speech.convert(
+        _ = b"".join(client_11labs.text_to_speech.convert(
             text="Hello.",
             voice_id=VOICE_ID,
             model_id=TTS_MODEL_ID,
             output_format=TTS_MP3_FORMAT,
-        )
-        # consume just the first tiny chunk
-        for _ in it:
-            break
+        ))
         print("✅ TTS warm")
     except Exception as e:
         print(f"⚠️ TTS warm failed: {e}")
@@ -460,28 +435,18 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 @app.post("/ask_text")
 async def ask_text(data: dict):
-    """
-    New behavior:
-      - Generate the text answer first (no TTS blocking).
-      - Start a background TTS writer that streams MP3 bytes to disk.
-      - Return immediately with audio_url pointing at the final filename.
-      - Unity can also hit /audio/cloned.wav which streams the same bytes.
-    """
     question = (data.get("question") or "").strip()
     if not question:
         return JSONResponse(content={"error": "No question provided"}, status_code=400)
 
-    result = chat_with_bot_text_only(question)
-    if "error" in result:
-        return JSONResponse(content=result, status_code=500)
-
-    # Kick off background TTS streaming and get the final basename for /tts/
-    final_name = _start_tts_background(result["answer"])
+    response, mp3_path = chat_with_bot(question)
+    if "error" in response:
+        return JSONResponse(content=response, status_code=500)
 
     return {
-        "answer": result["answer"],
-        "citations": result.get("citations", []),
-        "audio_url": f"/tts/{final_name}",
+        "answer": response["answer"],
+        "citations": response.get("citations", []),
+        "audio_url": f"/tts/{os.path.basename(mp3_path)}",
     }
 
 @app.post("/ask_audio")
@@ -494,16 +459,15 @@ async def ask_audio(file: UploadFile = File(...)):
         if question.startswith("❌"):
             raise ValueError(f"Transcription failed: {question}")
 
-        result = chat_with_bot_text_only(question)
-        if "error" in result:
-            raise ValueError(f"Bot returned error: {result['error']}")
+        response, mp3_path = chat_with_bot(question)
+        if "error" in response:
+            raise ValueError(f"Bot returned error: {response['error']}")
 
-        final_name = _start_tts_background(result["answer"])
         return {
             "question": question,
-            "answer": result["answer"],
-            "citations": result.get("citations", []),
-            "audio_url": f"/tts/{final_name}",
+            "answer": response["answer"],
+            "citations": response.get("citations", []),
+            "audio_url": f"/tts/{os.path.basename(mp3_path)}",
         }
 
     except Exception as e:
@@ -519,84 +483,24 @@ async def ask_audio(file: UploadFile = File(...)):
             status_code=500,
         )
 
-# ---------- Streaming routes (tail while writing) ----------
-def _tail_file_growing(tmp_path: str, final_path: str):
-    """
-    Yield bytes as a file grows. When final appears, switch to it and finish.
-    """
-    pos = 0
-    # loop until we reach final and exhaust it
-    while True:
-        if os.path.exists(final_path):
-            with open(final_path, "rb") as f:
-                f.seek(pos)
-                chunk = f.read(64 * 1024)
-                while chunk:
-                    yield chunk
-                    pos = f.tell()
-                    chunk = f.read(64 * 1024)
-            break
-
-        if os.path.exists(tmp_path):
-            with open(tmp_path, "rb") as f:
-                f.seek(pos)
-                chunk = f.read(64 * 1024)
-                while chunk:
-                    yield chunk
-                    pos = f.tell()
-                    chunk = f.read(64 * 1024)
-
-        time.sleep(0.03)
-
 @app.get("/tts/{filename}")
 async def get_tts(filename: str):
-    """
-    Serve finalized audio if present, otherwise stream from the .tmp file.
-    """
-    static_dir = "static"
-    final_path = os.path.join(static_dir, filename)
-    tmp_path = os.path.join(static_dir, f".tmp_{filename}")
-
-    if os.path.exists(final_path):
-        resp = FileResponse(final_path, media_type=_mime_for_ext(filename))
-        resp.headers["Accept-Ranges"] = "bytes"
-        resp.headers["Cache-Control"] = "no-store"
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        return resp
-
-    if os.path.exists(tmp_path):
-        resp = StreamingResponse(_tail_file_growing(tmp_path, final_path), media_type=_mime_for_ext(filename))
-        resp.headers["Accept-Ranges"] = "bytes"
-        resp.headers["Cache-Control"] = "no-store"
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        return resp
-
-    return JSONResponse(content={"error": "Audio not found"}, status_code=404)
+    path = os.path.join("static", filename)
+    if not os.path.exists(path):
+        return JSONResponse(content={"error": "Audio not found"}, status_code=404)
+    return FileResponse(path, media_type="audio/mpeg")
 
 # keep your existing route name/path the same
 @app.get("/audio/cloned.wav")
 async def get_cloned_audio():
-    """
-    Legacy path Unity calls. We return MP3 bytes but keep filename as 'cloned.wav'.
-    Stream from saved_outputs/.tmp_cloned.mp3 while it's being written.
-    """
-    saved_dir = "saved_outputs"
-    final_mp3 = os.path.join(saved_dir, "cloned.mp3")
-    tmp_mp3 = os.path.join(saved_dir, ".tmp_cloned.mp3")
-
-    if os.path.exists(final_mp3):
+    path_mp3 = os.path.join("saved_outputs", "cloned.mp3")
+    if os.path.exists(path_mp3):
+        # Serve MP3 bytes via the legacy .wav URL (frontend unchanged)
         return FileResponse(
-            final_mp3,
-            media_type="audio/mpeg",
+            path_mp3,
+            media_type="audio/mpeg",  # correct MIME for the actual content
             filename="cloned.wav"
         )
-    if os.path.exists(tmp_mp3):
-        resp = StreamingResponse(_tail_file_growing(tmp_mp3, final_mp3), media_type="audio/mpeg")
-        resp.headers["Accept-Ranges"] = "bytes"
-        resp.headers["Cache-Control"] = "no-store"
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        return resp
-
     return JSONResponse({"status": "error", "message": "Audio not found"}, status_code=404)
 
 @app.post("/reset")
